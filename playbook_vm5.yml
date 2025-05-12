@@ -1,0 +1,124 @@
+---
+- name: Configure WordPress with Nginx and SSL
+  hosts: localhost
+  become: yes
+  vars:
+    db_host: 192.168.56.12
+    db_name: wordpress
+    db_user: wpuser
+    db_password: securepassword
+
+  tasks:
+    - name: Проверить наличие диска
+      stat:
+        path: /dev/sdb
+      register: sdb_disk
+
+    - name: Создать файловую систему на дополнительном диске
+      filesystem:
+        fstype: ext4
+        dev: /dev/sdb
+      when: sdb_disk.stat.exists
+
+    - name: Создать точку монтирования
+      file:
+        path: /mnt/data
+        state: directory
+        mode: 0755
+
+    - name: Монтировать диск
+      mount:
+        path: /mnt/data
+        src: /dev/sdb
+        fstype: ext4
+        state: mounted
+      when: sdb_disk.stat.exists
+
+    - name: Install EPEL and required packages
+      yum:
+        name:
+          - epel-release
+          - nginx
+          - php-fpm
+          - php-mysqlnd
+          - php-json
+          - php-gd
+          - php-mbstring
+          - openssl
+        state: present
+
+    - name: Создать директорию для SSL сертификатов
+      file:
+        path: /etc/nginx/ssl
+        state: directory
+        mode: 0755
+
+    - name: Generate self-signed SSL certificate
+      command:
+        cmd: openssl req -x509 -nodes -days 365 -newkey rsa:2048 -keyout /etc/nginx/ssl/nginx.key -out /etc/nginx/ssl/nginx.crt -subj "/CN=wordpress.local"
+        creates: /etc/nginx/ssl/nginx.crt
+
+    - name: Create nginx config
+      template:
+        src: wordpress.conf.j2
+        dest: /etc/nginx/conf.d/wordpress.conf
+      notify: restart nginx
+
+    - name: Download WordPress
+      unarchive:
+        src: https://wordpress.org/latest.tar.gz
+        dest: /var/www/
+        remote_src: yes
+        creates: /var/www/wordpress
+
+    - name: Configure WordPress
+      template:
+        src: /home/vagrant/templates/wp-config.php.j2  # Новый путь
+        dest: /var/www/wordpress/wp-config.php
+        owner: nginx
+        group: nginx
+        mode: 0644
+
+    - name: Set permissions
+      file:
+        path: /var/www/wordpress
+        owner: nginx
+        group: nginx
+        recurse: yes
+
+    - name: Enable and start services
+      service:
+        name: "{{ item }}"
+        enabled: yes
+        state: started
+      loop:
+        - nginx
+        - php-fpm
+
+    - name: Configure firewall for WordPress
+      firewalld:
+        service: "{{ item }}"
+        permanent: yes
+        state: enabled
+        immediate: yes
+      loop:
+        - http
+        - https
+        - ssh
+      notify: restart firewall
+
+    - name: Add additional ports if needed
+      firewalld:
+        port: "{{ item }}/tcp"
+        permanent: yes
+        state: enabled
+        immediate: yes
+      loop:
+        - "8080"  # если нужны дополнительные порты
+      when: extra_ports is defined
+
+  handlers:
+    - name: restart nginx
+      service:
+        name: nginx
+        state: restarted

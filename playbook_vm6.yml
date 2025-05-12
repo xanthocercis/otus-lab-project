@@ -1,0 +1,133 @@
+---
+- name: Setup NGINX Load Balancer and Zabbix-agent2 with SELinux and Firewall
+  hosts: localhost
+  become: yes
+
+  tasks:
+    - name: Install required packages
+      dnf:
+        name:
+          - nginx
+          - zabbix-agent2
+          - policycoreutils-python-utils  # For SELinux management
+        state: present
+        update_cache: yes
+
+    - name: Ensure NGINX is running
+      service:
+        name: nginx
+        state: started
+        enabled: yes
+
+    - name: Ensure Zabbix-agent2 is running
+      service:
+        name: zabbix-agent2
+        state: started
+        enabled: yes
+
+    - name: Create NGINX configuration for load balancer
+      copy:
+        content: |
+          upstream wordpress_servers {
+              server 192.168.56.11:443;
+              server 192.168.56.15:443;
+          }
+
+          server {
+              listen 443 ssl;
+              server_name _;
+
+              # Self-signed certificate for load balancer
+              ssl_certificate /etc/nginx/ssl/selfsigned.crt;
+              ssl_certificate_key /etc/nginx/ssl/selfsigned.key;
+
+              location / {
+                  proxy_pass https://wordpress_servers;
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Real-IP $remote_addr;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto $scheme;
+                  proxy_ssl_verify off;  # Since we're using self-signed certs
+              }
+          }
+
+          server {
+              listen 80;
+              server_name _;
+              return 301 https://$host$request_uri;
+          }
+        dest: /etc/nginx/conf.d/loadbalancer.conf
+        mode: '0644'
+      notify: Reload NGINX
+
+    - name: Create directory for SSL certificates
+      file:
+        path: /etc/nginx/ssl
+        state: directory
+        mode: '0755'
+
+    - name: Generate self-signed certificate
+      command: >
+        openssl req -x509 -nodes -days 365 -newkey rsa:2048
+        -keyout /etc/nginx/ssl/selfsigned.key
+        -out /etc/nginx/ssl/selfsigned.crt
+        -subj "/C=US/ST=State/L=City/O=Organization/OU=Unit/CN=loadbalancer"
+      args:
+        creates: /etc/nginx/ssl/selfsigned.crt
+
+    - name: Set SELinux context for NGINX configuration
+      sefcontext:
+        target: '/etc/nginx/conf.d(/.*)?'
+        setype: httpd_config_t
+        state: present
+      notify: Restore SELinux context
+
+    - name: Set SELinux context for NGINX SSL certificates
+      sefcontext:
+        target: '/etc/nginx/ssl(/.*)?'
+        setype: cert_t
+        state: present
+      notify: Restore SELinux context
+
+    - name: Allow NGINX to make network connections
+      seboolean:
+        name: httpd_can_network_connect
+        state: yes
+        persistent: yes
+
+    - name: Allow Zabbix-agent2 to make network connections
+      seboolean:
+        name: zabbix_can_network
+        state: yes
+        persistent: yes
+
+    - name: Configure firewalld to allow HTTP and HTTPS
+      firewalld:
+        service: "{{ item }}"
+        permanent: yes
+        immediate: yes
+        state: enabled
+      loop:
+        - http
+        - https
+
+    - name: Configure firewalld to allow Zabbix-agent2
+      firewalld:
+        port: 10050/tcp
+        permanent: yes
+        immediate: yes
+        state: enabled
+
+    - name: Test NGINX configuration
+      command: nginx -t
+      changed_when: false
+
+  handlers:
+    - name: Reload NGINX
+      service:
+        name: nginx
+        state: reloaded
+
+    - name: Restore SELinux context
+      command: restorecon -R -v /etc/nginx
+      changed_when: true

@@ -1,0 +1,76 @@
+---
+- name: Promote MariaDB replica to master
+  hosts: localhost
+  become: yes
+  vars:
+    mysql_root_password: "secure_root_password"
+    new_replication_user: "replicator"
+    new_replication_password: "replica_pass"
+    
+  tasks:
+    - name: Stop replication
+      mysql_replication:
+        mode: stopreplica
+        login_user: root
+        login_password: "{{ mysql_root_password }}"
+        
+    - name: Reset replica configuration
+      mysql_replication:
+        mode: resetreplica
+        login_user: root
+        login_password: "{{ mysql_root_password }}"
+        
+    - name: Enable write mode
+      ini_file:
+        path: /etc/my.cnf.d/server.cnf
+        section: mysqld
+        option: read-only
+        value: "0"
+        backup: yes
+      notify: restart mariadb
+
+    - name: Get new master status
+      command: >
+        mysql -uroot -p{{ mysql_root_password }} -NBe "SHOW MASTER STATUS"
+      register: master_status
+      changed_when: false
+      
+    - name: Extract master log file
+      set_fact:
+        master_log_file: "{{ master_status.stdout.split()[0] }}"
+        
+    - name: Extract master log position
+      set_fact:
+        master_log_pos: "{{ master_status.stdout.split()[1] }}"
+        
+    - name: Create replication user
+      mysql_user:
+        name: "{{ new_replication_user }}"
+        host: "%"
+        password: "{{ new_replication_password }}"
+        priv: "*.*:REPLICATION SLAVE"
+        state: present
+        login_user: root
+        login_password: "{{ mysql_root_password }}"
+        
+    - name: Flush privileges
+      mysql_query:
+        login_user: root
+        login_password: "{{ mysql_root_password }}"
+        query: "FLUSH PRIVILEGES"
+        
+    - name: Show promotion results
+      debug:
+        msg: |
+          Promotion complete!
+          New master status:
+          File: {{ master_log_file }}
+          Position: {{ master_log_pos }}
+          Replication user: {{ new_replication_user }}
+          Use these values to configure other replicas
+          
+  handlers:
+    - name: restart mariadb
+      service:
+        name: mariadb
+        state: restarted

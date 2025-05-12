@@ -1,0 +1,143 @@
+---
+- name: Configure MariaDB Master
+  hosts: localhost
+  become: yes
+  vars:
+    mysql_root_password: secure_root_password
+    replication_user: replicator
+    replication_password: replica_pass
+
+  tasks:
+    - name: Install EPEL repository
+      yum:
+        name: epel-release
+        state: present
+
+    - name: Install required packages
+      yum:
+        name:
+          - mariadb-server
+          - python3-PyMySQL
+        state: present
+
+    - name: Start MariaDB temporarily without password
+      service:
+        name: mariadb
+        state: started
+
+    - name: Configure MariaDB
+      copy:
+        dest: /etc/my.cnf.d/server.cnf
+        content: |
+          [mysqld]
+          server-id=1
+          log-bin=mysql-bin
+          binlog-format=ROW
+          bind-address=0.0.0.0
+          expire_logs_days=10
+          max_binlog_size=100M
+          
+          [client]
+          socket=/var/lib/mysql/mysql.sock
+      notify: restart mariadb
+
+    - name: Set root password and secure installation
+      shell: |
+        # Set root password
+        mysql -uroot -e "ALTER USER 'root'@'localhost' IDENTIFIED BY '{{ mysql_root_password }}';"
+        
+        # Remove anonymous users
+        mysql -uroot -p{{ mysql_root_password }} -e "DELETE FROM mysql.user WHERE User='';"
+        
+        # Disallow remote root login
+        mysql -uroot -p{{ mysql_root_password }} -e "DELETE FROM mysql.user WHERE User='root' AND Host NOT IN ('localhost', '127.0.0.1', '::1');"
+        
+        # Remove test database
+        mysql -uroot -p{{ mysql_root_password }} -e "DROP DATABASE IF EXISTS test;"
+        mysql -uroot -p{{ mysql_root_password }} -e "DELETE FROM mysql.db WHERE Db='test' OR Db='test\\_%';"
+        
+        # Reload privileges
+        mysql -uroot -p{{ mysql_root_password }} -e "FLUSH PRIVILEGES;"
+      args:
+        executable: /bin/bash
+
+    - name: Create WordPress database
+      mysql_db:
+        name: wordpress
+        state: present
+        login_user: root
+        login_password: "{{ mysql_root_password }}"
+
+    - name: Create WordPress user
+      mysql_user:
+        name: wpuser
+        password: securepassword
+        priv: "wordpress.*:ALL"
+        host: "%"
+        login_user: root
+        login_password: "{{ mysql_root_password }}"
+
+    - name: Create Zabbix database
+      mysql_db:
+        name: zabbix
+        state: present
+        login_user: root
+        login_password: "{{ mysql_root_password }}"
+
+    - name: Create Zabbix user
+      mysql_user:
+        name: zabbix
+        password: zabbix
+        priv: "zabbix.*:ALL"
+        host: "%"
+        login_user: root
+        login_password: "{{ mysql_root_password }}"
+
+#    - name: Import Zabbix database schema and data
+#      mysql_db:
+#        name: zabbix
+#        state: import
+#        target: /usr/share/zabbix-sql-scripts/mysql/server.sql.gz
+#        login_user: zabbix
+#        login_password: zabbix
+
+
+
+    - name: Configure replication user
+      mysql_user:
+        name: "{{ replication_user }}"
+        password: "{{ replication_password }}"
+        host: "%"
+        priv: "*.*:REPLICATION SLAVE"
+        login_user: root
+        login_password: "{{ mysql_root_password }}"
+
+    - name: Configure firewall for MariaDB
+      firewalld:
+        service: "{{ item }}"
+        permanent: yes
+        state: enabled
+        immediate: yes
+      loop:
+        - mysql
+        - ssh
+##      notify: reload firewall
+    
+    - name: Allow custom ports for replication
+      firewalld:
+        port: "{{ item }}/tcp"
+        permanent: yes
+        state: enabled
+        immediate: yes
+      loop:
+        - "3306"  # основной порт MySQL
+        - "4567"  # для Galera (если используется кластер)
+        - "4568"
+        - "4444"
+      when: enable_replication | default(false)
+
+  handlers:
+    - name: restart mariadb
+      service:
+        name: mariadb
+        state: restarted

@@ -1,0 +1,16 @@
+[mysqld]
+server-id=1
+log-bin=mysql-bin
+binlog-format=ROW
+bind-address=0.0.0.0
+datadir=/var/lib/mysql
+socket=/var/lib/mysql/mysql.sock
+
+# Настройки репликации
+binlog-do-db=wordpress
+expire_logs_days=10
+max_binlog_size=100M
+log_bin_trust_function_creators = 1
+
+[client]
+socket=/var/lib/mysql/mysql.sock

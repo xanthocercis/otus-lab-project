@@ -1,0 +1,235 @@
+---
+- name: Базовая настройка ВМ
+  hosts: localhost
+  become: yes
+  vars:
+    backup_dirs: ['/etc', '/var/log', '/home']
+    ssh_port: 22
+    zabbix_server_ip: "192.168.56.14"  # IP вашего Zabbix сервера
+    loki_server_ip: "192.168.56.14"    # IP вашего Loki сервера
+
+  tasks:
+    # Обновление системы
+    - name: Обновить все пакеты
+      yum:
+        name: '*'
+        state: latest
+        update_cache: yes
+
+    # Установка базовых утилит
+    - name: Установить необходимые пакеты
+      yum:
+        name:
+          - nano
+          - wget
+          - curl
+          - htop
+          - net-tools
+          - telnet
+          - tcpdump
+          - lsof
+          - unzip
+        state: present
+
+    # Базовая безопасность SSH
+    - name: Запретить root-доступ по SSH
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^#?PermitRootLogin'
+        line: 'PermitRootLogin no'
+        validate: '/usr/sbin/sshd -t -f %s'
+      notify: Перезапустить SSH
+
+    - name: Отключить аутентификацию по паролю
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^#?PasswordAuthentication'
+        line: 'PasswordAuthentication no'
+        validate: '/usr/sbin/sshd -t -f %s'
+      notify: Перезапустить SSH
+
+    # Настройка Fail2Ban
+    - name: Установить fail2ban
+      yum:
+        name: fail2ban
+        state: present
+
+    - name: Настроить базовые правила jail.local
+      copy:
+        content: |
+          [DEFAULT]
+          bantime = 1h
+          findtime = 600
+          maxretry = 3
+
+          [sshd]
+          enabled = true
+          port = {{ ssh_port }}
+          logpath = %(sshd_log)s
+        dest: /etc/fail2ban/jail.d/00-base.conf
+        owner: root
+        group: root
+        mode: 0644
+      notify: Перезапустить Fail2Ban
+
+    # Настройка Firewall
+    - name: Включить firewalld
+      service:
+        name: firewalld
+        state: started
+        enabled: yes
+
+    - name: Открыть основные порты
+      firewalld:
+        port: "{{ item }}/tcp"
+        permanent: yes
+        state: enabled
+      loop:
+        - "{{ ssh_port }}"
+        - 80
+        - 443
+        - 10050
+      notify: Перезагрузить Firewall
+
+    # Настройка SELinux
+    - name: Установить SELinux в enforcing mode
+      selinux:
+        policy: targeted
+        state: enforcing
+
+    - name: Разрешить веб-серверу сетевые соединения
+      seboolean:
+        name: httpd_can_network_connect
+        state: yes
+        persistent: yes
+
+    - name: Install Zabbix repository RPM
+      command: rpm -Uvh https://repo.zabbix.com/zabbix/6.0/rhel/9/x86_64/zabbix-release-latest-6.0.el9.noarch.rpm
+      args:
+        creates: /etc/yum.repos.d/zabbix.repo
+      register: zabbix_repo_install
+      changed_when: zabbix_repo_install.rc == 0
+
+    - name: Import Zabbix GPG key
+      rpm_key:
+        key: https://repo.zabbix.com/zabbix-official-repo.key
+        state: present
+
+    - name: Установить Zabbix агент
+      yum:
+        name: zabbix-agent2
+        state: present
+
+    - name: Настроить Zabbix агент
+      template:
+        src: zabbix_agent2.conf.j2
+        dest: /etc/zabbix/zabbix_agent2.conf
+      notify: Перезапустить Zabbix агент
+
+    # Установка Promtail для отправки логов в Loki
+    - name: Скачать Promtail
+      get_url:
+        url: https://github.com/grafana/loki/releases/download/v2.8.0/promtail-linux-amd64.zip
+        dest: /tmp/promtail.zip
+        mode: '0755'
+
+    - name: Распаковать Promtail
+      unarchive:
+        src: /tmp/promtail.zip
+        dest: /usr/local/bin/
+        remote_src: yes
+        mode: '0755'
+        creates: /usr/local/bin/promtail-linux-amd64
+
+    - name: Создать симлинк для Promtail
+      file:
+        src: /usr/local/bin/promtail-linux-amd64
+        dest: /usr/local/bin/promtail
+        state: link
+
+    - name: Создать конфиг директорию для Promtail
+      file:
+        path: /etc/promtail
+        state: directory
+        mode: '0755'
+
+    - name: Настроить Promtail
+      template:
+        src: promtail-config.yaml.j2
+        dest: /etc/promtail/config.yaml
+      notify: restart promtail
+
+    - name: Создать systemd unit для Promtail
+      copy:
+        content: |
+          [Unit]
+          Description=Promtail service
+          After=network.target
+
+          [Service]
+          Type=simple
+          User=root
+          ExecStart=/usr/local/bin/promtail -config.file=/etc/promtail/config.yaml
+          Restart=always
+
+          [Install]
+          WantedBy=multi-user.target
+        dest: /etc/systemd/system/promtail.service
+        mode: '0644'
+      notify:
+        - Перезагрузить systemd
+        - Запустить Promtail
+
+    # Работа с дисками (раскомментируйте при необходимости)
+    # - name: Создать файловую систему на дополнительном диске
+    #   filesystem:
+    #     fstype: ext4
+    #     dev: /dev/sdb
+    #   when: ansible_devices.sdb is defined
+
+    #Настройка бэкапов (раскомментируйте при необходимости)
+    - name: Создать директорию для бэкапов
+      file:
+        path: /backup
+        state: directory
+        mode: '0755'
+
+    - name: Настроить ежедневный бэкап
+      cron:
+        name: "Ежедневный бэкап"
+        minute: "0"
+        hour: "2"
+        job: "/usr/bin/tar czf /backup/backup-$(date +\\%Y\\%m\\%d).tar.gz {{ backup_dirs | join(' ') }}"
+        cron_file: daily_backup
+        user: vagrant
+
+  handlers:
+    - name: Перезапустить SSH
+      service:
+        name: sshd
+        state: restarted
+
+    - name: Перезапустить Fail2Ban
+      service:
+        name: fail2ban
+        state: restarted
+
+    - name: Перезагрузить Firewall
+      service:
+        name: firewalld
+        state: reloaded
+
+    - name: Перезапустить Zabbix агент
+      service:
+        name: zabbix-agent2
+        state: restarted
+
+    - name: Перезагрузить systemd
+      systemd:
+        daemon_reload: yes
+
+    - name: Запустить Promtail
+      service:
+        name: promtail
+        state: started
+        enabled: yes

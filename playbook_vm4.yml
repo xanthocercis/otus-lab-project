@@ -1,0 +1,364 @@
+- name: Configure Zabbix and Grafana Loki with NGINX using Podman
+  hosts: localhost
+  become: yes
+
+  vars:
+    grafana_port: 6001
+    loki_port: 3100
+    zabbix_web_port: 8080
+    zabbix_server_port: 10051
+    zabbix_db_host: "192.168.56.12"
+    zabbix_db_name: "zabbix"
+    zabbix_db_user: "zabbix"
+    zabbix_db_password: "zabbix"
+
+  tasks:
+    - name: Install EPEL repository
+      yum:
+        name: epel-release
+        state: present
+
+    - name: Install Podman and related tools
+      yum:
+        name:
+          - podman
+          - podman-docker
+        state: present
+
+    - name: Install NGINX
+      yum:
+        name: nginx
+        state: present
+
+    - name: Install required PHP packages for Nginx
+      yum:
+        name:
+          - php
+          - php-fpm
+          - php-mysqlnd
+        state: present
+
+    - name: Add Grafana repository
+      yum_repository:
+        name: grafana
+        description: Grafana Repository
+        baseurl: https://packages.grafana.com/oss/rpm
+        repo_gpgcheck: 1
+        gpgcheck: 1
+        gpgkey: https://packages.grafana.com/gpg.key
+        sslverify: 1
+        sslcacert: /etc/pki/tls/certs/ca-bundle.crt
+        state: present
+
+    - name: Install Grafana, Loki, and Promtail
+      yum:
+        name:
+          - grafana
+          - loki
+          - promtail
+        state: present
+
+    - name: Create Loki data directory
+      file:
+        path: /tmp/loki
+        state: directory
+        mode: '0755'
+
+    - name: Configure Loki
+      copy:
+        dest: /etc/loki/local-config.yaml
+        content: |
+          auth_enabled: false
+          server:
+            http_listen_port: {{ loki_port }}
+          ingester:
+            lifecycler:
+              address: 127.0.0.1
+              ring:
+                kvstore:
+                  store: inmemory
+                replication_factor: 1
+              final_sleep: 0s
+            chunk_idle_period: 5m
+            chunk_retain_period: 30s
+          schema_config:
+            configs:
+              - from: 2020-10-24
+                store: boltdb-shipper
+                object_store: filesystem
+                schema: v11
+                index:
+                  prefix: index_
+                  period: 24h
+          storage_config:
+            boltdb:
+              directory: /tmp/loki/index
+            filesystem:
+              directory: /tmp/loki/chunks
+          limits_config:
+            enforce_metric_name: false
+            reject_old_samples: true
+            reject_old_samples_max_age: 168h
+          chunk_store_config:
+            max_look_back_period: 0s
+          table_manager:
+            retention_deletes_enabled: false
+            retention_period: 0s
+
+    - name: Configure Promtail
+      copy:
+        dest: /etc/promtail/config.yml
+        content: |
+          server:
+            http_listen_port: 9080
+            grpc_listen_port: 0
+          positions:
+            filename: /tmp/positions.yaml
+          clients:
+            - url: http://localhost:{{ loki_port }}/loki/api/v1/push
+          scrape_configs:
+            - job_name: system
+              static_configs:
+                - targets:
+                    - localhost
+                  labels:
+                    job: varlogs
+                    __path__: /var/log/*log
+
+    - name: Pull Zabbix server container image
+      command: podman pull docker.io/zabbix/zabbix-server-mysql:centos-latest
+
+    - name: Pull Zabbix web interface container image
+      command: podman pull docker.io/zabbix/zabbix-web-nginx-mysql:centos-latest
+
+    - name: Remove existing Zabbix pod if it exists
+      command: podman pod rm -f zabbix-pod
+      ignore_errors: yes
+
+    - name: Create Pod for Zabbix
+      command: podman pod create --name zabbix-pod -p {{ zabbix_server_port }}:10051 -p {{ zabbix_web_port }}:8080
+
+    - name: Run Zabbix server container
+      command: >
+        podman run -d --name zabbix-server
+        --pod zabbix-pod
+        -e DB_SERVER_HOST={{ zabbix_db_host }}
+        -e DB_SERVER_PORT="3306"
+        -e MYSQL_DATABASE={{ zabbix_db_name }}
+        -e MYSQL_USER={{ zabbix_db_user }}
+        -e MYSQL_PASSWORD={{ zabbix_db_password }}
+        -e ZBX_SERVER_HOST="localhost"
+        docker.io/zabbix/zabbix-server-mysql:centos-latest
+
+    - name: Run Zabbix web container with Nginx
+      command: >
+        podman run -d --name zabbix-web
+        --pod zabbix-pod
+        -e DB_SERVER_HOST={{ zabbix_db_host }}
+        -e DB_SERVER_PORT="3306"
+        -e MYSQL_DATABASE={{ zabbix_db_name }}
+        -e MYSQL_USER={{ zabbix_db_user }}
+        -e MYSQL_PASSWORD={{ zabbix_db_password }}
+        -e ZBX_SERVER_HOST="localhost"
+        -e PHP_TZ="Europe/Moscow"
+        docker.io/zabbix/zabbix-web-nginx-mysql:centos-latest
+
+#    - name: Ensure Zabbix web is accessible
+#      command: curl --fail http://localhost:{{ zabbix_web_port }}
+#      register: zabbix_web_check
+#      retries: 5
+#      delay: 5
+#      until: zabbix_web_check.rc == 0
+
+    - name: Configure PHP settings for Nginx
+      block:
+        - name: Set PHP post_max_size to 16M
+          lineinfile:
+            path: /etc/php.ini
+            regexp: '^post_max_size'
+            line: 'post_max_size = 16M'
+
+        - name: Set PHP max_execution_time to 300
+          lineinfile:
+            path: /etc/php.ini
+            regexp: '^max_execution_time'
+            line: 'max_execution_time = 300'
+
+        - name: Set PHP max_input_time to 300
+          lineinfile:
+            path: /etc/php.ini
+            regexp: '^max_input_time'
+            line: 'max_input_time = 300'
+
+        - name: Set PHP date.timezone
+          lineinfile:
+            path: /etc/php.ini
+            regexp: '^;?date.timezone'
+            line: 'date.timezone = Europe/Moscow'
+
+      notify:
+        - restart php-fpm
+        - restart nginx
+
+    - name: Configure PHP-FPM
+      template:
+        src: /home/vagrant/templates/php-fpm.conf.j2
+        dest: /etc/php-fpm.d/www.conf
+      notify: restart php-fpm
+
+    - name: Configure NGINX for Zabbix and Grafana
+      copy:
+        dest: /etc/nginx/nginx.conf
+        content: |
+          user nginx;
+          worker_processes auto;
+          error_log /var/log/nginx/error.log;
+          pid /run/nginx.pid;
+
+          events {
+              worker_connections 1024;
+          }
+
+          http {
+              log_format  main  '$remote_addr - $remote_user [$time_local] "$request" '
+                                '$status $body_bytes_sent "$http_referer" '
+                                '"$http_user_agent" "$http_x_forwarded_for"';
+
+              access_log  /var/log/nginx/access.log  main;
+
+              sendfile            on;
+              tcp_nopush          on;
+              tcp_nodelay         on;
+              keepalive_timeout   65;
+              types_hash_max_size 2048;
+
+              include             /etc/nginx/mime.types;
+              default_type        application/octet-stream;
+
+              server {
+                  listen       80;
+                  server_name  _;
+
+                  location / {
+                      proxy_pass http://localhost:{{ zabbix_web_port }};
+                      proxy_set_header Host $host;
+                      proxy_set_header X-Real-IP $remote_addr;
+                      proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                      proxy_set_header X-Forwarded-Proto $scheme;
+                  }
+              }
+
+              server {
+                  listen       {{ grafana_port }};
+                  server_name  _;
+
+                  location / {
+                      proxy_pass http://localhost:3000;
+                      proxy_set_header Host $host;
+                      proxy_set_header X-Real-IP $remote_addr;
+                      proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                      proxy_set_header X-Forwarded-Proto $scheme;
+                  }
+              }
+          }
+      notify: restart nginx
+
+    - name: Create PHP session directory
+      file:
+        path: /var/lib/php/session
+        state: directory
+        owner: nginx
+        group: nginx
+        mode: '0770'
+
+    - name: Configure SELinux for NGINX
+      seboolean:
+        name: httpd_can_network_connect
+        state: yes
+        persistent: yes
+
+    - name: Allow NGINX to bind to Zabbix and Grafana ports
+      seport:
+        ports: "{{ item }}"
+        proto: tcp
+        setype: http_port_t
+        state: present
+      loop:
+        - 80
+        - "{{ zabbix_web_port }}"
+        - "{{ zabbix_server_port }}"
+        - "{{ grafana_port }}"
+
+    - name: Set SELinux context for PHP session directory
+      sefcontext:
+        target: '/var/lib/php/session(/.*)?'
+        setype: httpd_sys_rw_content_t
+        state: present
+      notify: restorecon php session
+
+    - name: Create Podman run directory if not exists
+      file:
+        path: /var/run/podman
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: Set SELinux context for Podman sockets
+      sefcontext:
+        target: '/var/run/podman(/.*)?'
+        setype: container_file_t
+        state: present
+      notify: restorecon podman
+
+#    - name: Ensure Zabbix containers are running
+#      command: podman ps -a --filter "name={{ item }}" --format "{{.Status}}"
+#      register: container_status
+#      changed_when: false
+#      loop:
+#        - zabbix-server
+#        - zabbix-web
+#      failed_when: "'Up' not in container_status.stdout"
+
+    - name: Enable and start services
+      service:
+        name: "{{ item }}"
+        enabled: yes
+        state: started
+      loop:
+        - php-fpm
+        - loki
+        - promtail
+        - grafana-server
+        - nginx
+
+    - name: Open firewall ports
+      firewalld:
+        port: "{{ item.port }}/{{ item.proto }}"
+        permanent: yes
+        state: enabled
+        immediate: yes
+      loop:
+        - { port: 80, proto: tcp }
+        - { port: 443, proto: tcp }
+        - { port: "{{ zabbix_server_port }}", proto: tcp }
+        - { port: "{{ grafana_port }}", proto: tcp }
+        - { port: "{{ loki_port }}", proto: tcp }
+        - { port: "{{ zabbix_web_port }}", proto: tcp }
+
+  handlers:
+    - name: restart php-fpm
+      service:
+        name: php-fpm
+        state: restarted
+
+    - name: restart nginx
+      service:
+        name: nginx
+        state: restarted
+
+    - name: restorecon php session
+      command: restorecon -R /var/lib/php/session
+
+    - name: restorecon podman
+      command: restorecon -R /var/run/podman
